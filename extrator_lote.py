@@ -18,6 +18,7 @@ import requests
 from requests.adapters import HTTPAdapter
 import trafilatura
 from urllib3.util import Retry
+from notifyer import enviar_alerta_telegram
 
 socket.setdefaulttimeout(3.0)
 
@@ -503,6 +504,7 @@ def expurgar_recursos_sistema():
 
 
 def processar_arquivo(caminho_arquivo: str):
+  t_ini_arquivo = time.perf_counter()
   nome_arq = os.path.basename(caminho_arquivo)
   with open(caminho_arquivo, "r", encoding="utf-8") as f:
     lote = json.load(f)
@@ -645,6 +647,38 @@ def processar_arquivo(caminho_arquivo: str):
 
   expurgar_recursos_sistema()
   logging.info(f"[CONCLUÍDO] {nome_arq} gravado.")
+  t_duracao = time.perf_counter() - t_ini_arquivo
+    suc_final = sum(
+        1
+        for it in lote
+        if it.get("status_extracao") == "SUCESSO" and it.get("texto_completo")
+    )
+    desist_final = sum(
+        1
+        for it in lote
+        if it.get("status_resolucao")
+        in [
+            "CONTEUDO_MIDIA",
+            "PLATAFORMA_FECHADA",
+            "REDIRECT_HOMEPAGE",
+            "LINK_MORTO",
+        ]
+    )
+    bloq_final = sum(
+        1
+        for it in lote
+        if it.get("status_extracao") in ["FALHA_ACESSO", "TIMEOUT_BROWSER"]
+    )
+
+    enviar_alerta_telegram(
+        nome_arquivo=nome_arq,
+        runner_id=runner_id,
+        total_itens=total_n,
+        sucessos=suc_final,
+        desistencias=desist_final,
+        falhas_acesso=bloq_final,
+        tempo_execucao_s=t_duracao,
+    )
 
 
 if __name__ == "__main__":
@@ -652,7 +686,10 @@ if __name__ == "__main__":
   parser.add_argument(
       "--arquivos", nargs="+", required=True, help="Arquivos para processar"
   )
+  parser.add_argument(
+      "--runner_id", type=int, default=0, help="Identificador do Runner"
+  )
   args = parser.parse_args()
   for arq in args.arquivos:
     if os.path.exists(arq):
-      processar_arquivo(arq)
+      processar_arquivo(arq, runner_id=args.runner_id)
