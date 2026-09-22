@@ -42,6 +42,7 @@ jobs:
           scope = drive
           service_account_file = /tmp/gdrive_sa.json
           root_folder_id = $GDRIVE_FOLDER_ID
+          include_shared_with_me = true
           EOF
 
       - name: Baixar Lote Específico do Runner
