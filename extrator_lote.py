@@ -1,0 +1,658 @@
+import argparse
+import asyncio
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import gc
+import json
+import logging
+import math
+import os
+import random
+import re
+import socket
+from typing import Dict, List, Optional, Tuple
+from urllib.parse import urlparse
+from bs4 import BeautifulSoup
+import googlenewsdecoder as gnd
+from playwright.async_api import async_playwright
+import requests
+from requests.adapters import HTTPAdapter
+import trafilatura
+from urllib3.util import Retry
+
+socket.setdefaulttimeout(3.0)
+
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
+)
+
+# Constantes e Metas Metodológicas
+META_SUCESSO_GLOBAL = 42.0
+TAMANHO_MINIMO_TEXTO = 200
+MAX_WORKERS_HTTP = 8
+
+DOMINIOS_MIDIA = {
+    "youtube.com",
+    "youtu.be",
+    "spotify.com",
+    "open.spotify.com",
+    "soundcloud.com",
+    "vimeo.com",
+    "globoplay.globo.com",
+    "podcasts.apple.com",
+}
+DOMINIOS_FECHADOS = {
+    "twitter.com",
+    "x.com",
+    "facebook.com",
+    "instagram.com",
+    "linkedin.com",
+}
+
+USER_AGENTS = [
+    (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML,"
+        " like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+        " (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
+    ),
+    (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko)"
+        " Chrome/122.0.0.0 Safari/537.36"
+    ),
+]
+
+PADROES_ANTIBOT = [
+    r"unsanctioned scraping by bots",
+    r"instituted a challenge designed to keep them out",
+    r"enable javascript and cookies to continue",
+    r"checking your browser before accessing",
+    r"attention required!? \| cloudflare",
+    r"please verify you are a human",
+    r"access denied \| \d+ access denied",
+    r"ray id: [a-f0-9]{16}",
+    r"pardon our interruption",
+    r"verifique se você é humano",
+    r"ative o javascript para continuar",
+    r"acesso negado",
+    r"security check to access",
+    r"ddos protection by cloudflare",
+    r"block details:.*incident id",
+    r"perimeterx",
+    r"datadome",
+]
+REGEX_ANTIBOT = re.compile("|".join(PADROES_ANTIBOT), re.IGNORECASE)
+
+
+def criar_sessao_http() -> requests.Session:
+  s = requests.Session()
+  retry = Retry(
+      total=1,
+      backoff_factor=0.2,
+      status_forcelist=[429, 500, 502, 503, 504],
+      raise_on_status=False,
+  )
+  adapter = HTTPAdapter(
+      pool_connections=24, pool_maxsize=24, max_retries=retry
+  )
+  s.mount("http://", adapter)
+  s.mount("https://", adapter)
+  return s
+
+
+HTTP_SESSION = criar_sessao_http()
+
+
+def classificar_url_terminal(url: str) -> Optional[str]:
+  if not url or not isinstance(url, str):
+    return None
+  try:
+    parsed = urlparse(url.lower())
+    netloc = parsed.netloc.replace("www.", "")
+    if any(netloc == d or netloc.endswith("." + d) for d in DOMINIOS_MIDIA):
+      return "CONTEUDO_MIDIA"
+    if any(netloc == d or netloc.endswith("." + d) for d in DOMINIOS_FECHADOS):
+      return "PLATAFORMA_FECHADA"
+    path = parsed.path.strip("/")
+    if not path or path in [
+        "index.html",
+        "index.php",
+        "home",
+        "noticias",
+        "economia",
+        "politica",
+    ]:
+      if not parsed.query:
+        return "REDIRECT_HOMEPAGE"
+  except Exception:
+    pass
+  return None
+
+
+def sanitizar_url_canonica(url: Optional[str]) -> Optional[str]:
+  if not url or not isinstance(url, str):
+    return None
+  u = url.strip()
+  if not u.startswith("http"):
+    return None
+  if any(
+      g in u
+      for g in [
+          "news.google.com",
+          "google.com",
+          "googlenews",
+          "consent.google",
+      ]
+  ):
+    return None
+  return u
+
+
+def eh_canonica(url: str) -> bool:
+  return sanitizar_url_canonica(url) is not None
+
+
+def decodificar_offline(url_google: str) -> Optional[str]:
+  if not url_google or "articles/" not in url_google:
+    return None
+  try:
+    token = url_google.split("articles/")[-1].split("?")[0].strip()
+    padded = token + "=" * (-len(token) % 4)
+    raw = base64.urlsafe_b64decode(padded)
+    for u in re.findall(rb"https?://[a-zA-Z0-9_\-\.\/\?\=\&\%\#\:\@]+", raw):
+      u_str = u.decode("utf-8", errors="ignore").rstrip('\\"')
+      if "google.com" not in u_str and "." in u_str and len(u_str) > 15:
+        return u_str
+  except Exception:
+    pass
+  return None
+
+
+def extrair_canonica_html(html: str) -> Optional[str]:
+  if not html:
+    return None
+  try:
+    soup = BeautifulSoup(html[:20480], "html.parser")
+    tag_link = soup.find(
+        "link", rel=lambda val: val and "canonical" in val.lower()
+    )
+    if tag_link and tag_link.get("href"):
+      u = sanitizar_url_canonica(tag_link["href"])
+      if u:
+        return u
+    tag_og = soup.find("meta", property="og:url")
+    if tag_og and tag_og.get("content"):
+      u = sanitizar_url_canonica(tag_og["content"])
+      if u:
+        return u
+  except Exception:
+    pass
+  return None
+
+
+def decodificar_google_rpc(url: str) -> Optional[str]:
+  if "news.google.com" not in url:
+    return sanitizar_url_canonica(url)
+  try:
+    res = gnd.decoderv1(url, interval=0.1)
+    if res and res.get("status"):
+      return sanitizar_url_canonica(res.get("decoded_url"))
+  except Exception:
+    pass
+  return None
+
+
+def extrair_texto_hibrido(html_ou_texto: str) -> Optional[str]:
+  if not html_ou_texto:
+    return None
+
+  texto = trafilatura.extract(
+      html_ou_texto, include_comments=False, include_tables=False
+  )
+  if (
+      texto
+      and len(texto.strip()) >= TAMANHO_MINIMO_TEXTO
+      and not REGEX_ANTIBOT.search(texto)
+  ):
+    return texto.strip()
+
+  try:
+    soup = BeautifulSoup(html_ou_texto, "html.parser")
+    for elemento in soup(
+        ["script", "style", "nav", "header", "footer", "aside", "form"]
+    ):
+      elemento.decompose()
+    paragrafos = [
+        p.get_text().strip()
+        for p in soup.find_all("p")
+        if len(p.get_text().strip()) >= 35
+    ]
+    texto_dom = "\n\n".join(paragrafos)
+    if (
+        len(texto_dom) >= TAMANHO_MINIMO_TEXTO
+        and not REGEX_ANTIBOT.search(texto_dom)
+    ):
+      return texto_dom
+  except Exception:
+    pass
+
+  return None
+
+
+def extrair_texto_e_canonica_http(
+    url: str,
+) -> Tuple[Optional[str], Optional[str]]:
+  try:
+    headers = {"User-Agent": random.choice(USER_AGENTS)}
+    resp = HTTP_SESSION.get(
+        url, headers=headers, timeout=(2.5, 4.0), allow_redirects=True
+    )
+    if resp.status_code == 200 and resp.text:
+      can_meta = extrair_canonica_html(resp.text)
+      can_final = can_meta or sanitizar_url_canonica(resp.url)
+      txt = extrair_texto_hibrido(resp.text)
+      return txt, can_final
+  except Exception:
+    pass
+  return None, None
+
+
+def processar_item_estagio_http(item_tuple: Tuple[int, dict]) -> Tuple[int, dict, bool]:
+  idx, item = item_tuple
+  ja_tinha_txt = bool(
+      item.get("status_extracao") == "SUCESSO" and item.get("texto_completo")
+  )
+  if ja_tinha_txt:
+    return idx, item, True
+
+  if item.get("status_extracao") == "FALHA_ACESSO":
+    return idx, item, False
+
+  url_p = (
+      sanitizar_url_canonica(item.get("url_canonica_resolvida"))
+      or item.get("url_utilizada")
+      or item.get("url_original_rss")
+      or ""
+  )
+
+  # 1. Base64 Offline
+  if not eh_canonica(url_p):
+    u_off = sanitizar_url_canonica(decodificar_offline(url_p))
+    if u_off:
+      url_p = u_off
+      item["url_canonica_resolvida"] = u_off
+      item["url_utilizada"] = u_off
+
+  # 2. RPC Google News
+  if not eh_canonica(url_p) and "news.google.com" in url_p:
+    u_rpc = decodificar_google_rpc(url_p)
+    if u_rpc:
+      url_p = u_rpc
+      item["url_canonica_resolvida"] = u_rpc
+      item["url_utilizada"] = u_rpc
+
+  # 3. Resolução de Espelhos
+  espelhos = (
+      item.get("urls_espelho_canonicas")
+      or item.get("urls_espelho_disponiveis")
+      or item.get("urls_espelho")
+      or []
+  )
+  espelhos_resolvidos = []
+  for u_esp in espelhos:
+    u_clean = sanitizar_url_canonica(u_esp)
+    if u_clean:
+      espelhos_resolvidos.append(u_clean)
+    else:
+      u_rpc_esp = decodificar_google_rpc(u_esp)
+      espelhos_resolvidos.append(u_rpc_esp if u_rpc_esp else u_esp)
+
+  if not eh_canonica(url_p):
+    for u_e in espelhos_resolvidos:
+      if eh_canonica(u_e):
+        url_p = u_e
+        item["url_canonica_resolvida"] = u_e
+        item["url_utilizada"] = u_e
+        break
+
+  item["urls_espelho_canonicas"] = [
+      u for u in espelhos_resolvidos if eh_canonica(u)
+  ]
+  item["urls_espelho_disponiveis"] = espelhos_resolvidos
+
+  cat_term = classificar_url_terminal(url_p)
+  if cat_term:
+    item["status_resolucao"] = cat_term
+    item["status_extracao"] = "FALHA_ESTRUTURAL"
+    item["motivo_bloqueio"] = cat_term
+    return idx, item, False
+
+  if eh_canonica(url_p):
+    texto, can_extra = extrair_texto_e_canonica_http(url_p)
+    if can_extra and not eh_canonica(item.get("url_canonica_resolvida")):
+      item["url_canonica_resolvida"] = can_extra
+      item["url_utilizada"] = can_extra
+
+    if texto:
+      item["texto_completo"] = texto
+      item["status_extracao"] = "SUCESSO"
+      item["status_resolucao"] = "RESOLVIDO"
+      item["motivo_bloqueio"] = None
+      item["necessita_extracao_manual"] = False
+      return idx, item, True
+
+    # Fallback em espelhos
+    for u_esp_can in item["urls_espelho_canonicas"]:
+      texto_esp, can_esp_extra = extrair_texto_e_canonica_http(u_esp_can)
+      if texto_esp:
+        item["url_canonica_resolvida"] = can_esp_extra or u_esp_can
+        item["url_utilizada"] = can_esp_extra or u_esp_can
+        item["texto_completo"] = texto_esp
+        item["status_extracao"] = "SUCESSO"
+        item["status_resolucao"] = "RESOLVIDO"
+        item["motivo_bloqueio"] = None
+        item["necessita_extracao_manual"] = False
+        return idx, item, True
+
+    item["status_extracao"] = "FALHA_ACESSO"
+    item["motivo_bloqueio"] = "HTTP_TIMEOUT_OU_BLOQUEIO"
+    item["status_resolucao"] = "RESOLVIDO"
+    return idx, item, False
+
+  item["status_resolucao"] = "PENDENTE"
+  item["status_extracao"] = "PENDENTE"
+  return idx, item, False
+
+
+async def _navegar_com_timeout_estrito(context, item_tuple: Tuple[int, dict]) -> Tuple[int, dict, bool]:
+  idx, item = item_tuple
+  url_alvo = item.get("url_utilizada") or item.get("url_original_rss") or ""
+  page = None
+  sucesso = False
+  try:
+    page = await context.new_page()
+    await page.add_init_script(
+        "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+    )
+    await page.route(
+        "**/*",
+        lambda r: (
+            r.abort()
+            if r.request.resource_type
+            in ["image", "media", "font", "stylesheet"]
+            else r.continue_()
+        ),
+    )
+    await page.goto(url_alvo, wait_until="domcontentloaded", timeout=5000)
+
+    if "consent.google" in page.url or "google.com" in page.url:
+      for sel in [
+          "button:has-text('Aceitar tudo')",
+          "button:has-text('Concordo')",
+          "button:has-text('Accept all')",
+      ]:
+        try:
+          btn = page.locator(sel).first
+          if await btn.is_visible(timeout=800):
+            await btn.click()
+            break
+        except Exception:
+          pass
+      try:
+        await page.wait_for_url(lambda u: "google" not in u, timeout=3000)
+      except Exception:
+        pass
+
+    conteudo_html = await page.content()
+    url_final = extrair_canonica_html(conteudo_html) or sanitizar_url_canonica(
+        page.url
+    )
+
+    if url_final:
+      item["url_canonica_resolvida"] = url_final
+      item["url_utilizada"] = url_final
+      item["status_resolucao"] = "RESOLVIDO"
+      texto = extrair_texto_hibrido(conteudo_html)
+      if texto:
+        item["texto_completo"] = texto
+        item["status_extracao"] = "SUCESSO"
+        item["motivo_bloqueio"] = None
+        item["necessita_extracao_manual"] = False
+        sucesso = True
+      else:
+        item["status_extracao"] = "TEXTO_INSUFICIENTE"
+        item["motivo_bloqueio"] = "CONTEUDO_CURTO_OU_BLOQUEADO"
+    else:
+      cat_term = classificar_url_terminal(page.url)
+      if cat_term:
+        item["status_resolucao"] = cat_term
+        item["status_extracao"] = "FALHA_ESTRUTURAL"
+        item["motivo_bloqueio"] = cat_term
+      else:
+        item["status_resolucao"] = "FALHA_REDIRECT"
+        item["status_extracao"] = "FALHA_ACESSO"
+        item["motivo_bloqueio"] = "NAO_REDIRECIONOU_GOOGLE"
+  except Exception as e:
+    item["status_extracao"] = "TIMEOUT_BROWSER"
+    item["motivo_bloqueio"] = str(type(e).__name__)
+  finally:
+    if page:
+      try:
+        await page.close()
+      except Exception:
+        pass
+  return idx, item, sucesso
+
+
+async def processar_lote_playwright_async(
+    itens: List[Tuple[int, dict]],
+) -> List[Tuple[int, dict, bool]]:
+  if not itens:
+    return []
+  async with async_playwright() as p:
+    browser = await p.chromium.launch(
+        headless=True,
+        args=[
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-blink-features=AutomationControlled",
+            "--disable-gpu",
+        ],
+    )
+    context = await browser.new_context(
+        user_agent=random.choice(USER_AGENTS),
+        viewport={"width": 1280, "height": 800},
+    )
+    sem = asyncio.Semaphore(4)
+
+    async def _safe_run(par):
+      async with sem:
+        try:
+          return await asyncio.wait_for(
+              _navegar_com_timeout_estrito(context, par), timeout=8.0
+          )
+        except asyncio.TimeoutError:
+          par[1]["status_extracao"] = "TIMEOUT_BROWSER"
+          par[1]["motivo_bloqueio"] = "DEADLOCK_TIMEOUT"
+          return par[0], par[1], False
+
+    res = await asyncio.gather(*[_safe_run(item_par) for item_par in itens])
+    await context.close()
+    await browser.close()
+    return res
+
+
+def processar_lote_playwright(
+    itens: List[Tuple[int, dict]],
+) -> List[Tuple[int, dict, bool]]:
+  loop = asyncio.get_event_loop()
+  return loop.run_until_complete(processar_lote_playwright_async(itens))
+
+
+def expurgar_recursos_sistema():
+  global HTTP_SESSION
+  os.system("pkill -9 -f chrome || true")
+  os.system("pkill -9 -f playwright || true")
+  gc.collect()
+  try:
+    HTTP_SESSION.close()
+  except Exception:
+    pass
+  HTTP_SESSION = criar_sessao_http()
+
+
+def processar_arquivo(caminho_arquivo: str):
+  nome_arq = os.path.basename(caminho_arquivo)
+  with open(caminho_arquivo, "r", encoding="utf-8") as f:
+    lote = json.load(f)
+
+  total_n = len(lote)
+  if total_n == 0:
+    return
+
+  sucesso_ini = sum(
+      1
+      for it in lote
+      if it.get("status_extracao") == "SUCESSO" and it.get("texto_completo")
+  )
+  desist_ini = sum(
+      1
+      for it in lote
+      if it.get("status_resolucao")
+      in [
+          "CONTEUDO_MIDIA",
+          "PLATAFORMA_FECHADA",
+          "REDIRECT_HOMEPAGE",
+          "LINK_MORTO",
+      ]
+  )
+  univ_util = max(1, total_n - desist_ini)
+
+  if (sucesso_ini / univ_util * 100.0) >= META_SUCESSO_GLOBAL:
+    logging.info(
+        f"[SALTADO] {nome_arq} já alcançou a meta ({sucesso_ini}/{univ_util} ="
+        f" {sucesso_ini/univ_util*100:.1f}%)"
+    )
+    return
+
+  logging.info(
+      f"[PROCESSANDO] {nome_arq} - Total: {total_n} | Válidos Iniciais:"
+      f" {sucesso_ini} ({sucesso_ini/univ_util*100:.1f}%)"
+  )
+
+  # Estágio 1: Fast HTTP
+  pendentes_http = [
+      (i, it)
+      for i, it in enumerate(lote)
+      if not (it.get("status_extracao") == "SUCESSO" and it.get("texto_completo"))
+  ]
+  random.shuffle(pendentes_http)
+
+  CHUNK = 60
+  for c in range(0, len(pendentes_http), CHUNK):
+    chunk = pendentes_http[c : c + CHUNK]
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS_HTTP) as executor:
+      futuros = {
+          executor.submit(processar_item_estagio_http, par): par[0]
+          for par in chunk
+      }
+      for fut in as_completed(futuros):
+        idx, item_proc, _ = fut.result()
+        lote[idx] = item_proc
+
+    suc_atual = sum(
+        1
+        for it in lote
+        if it.get("status_extracao") == "SUCESSO" and it.get("texto_completo")
+    )
+    if (suc_atual / univ_util * 100.0) >= META_SUCESSO_GLOBAL:
+      break
+
+  # Estágio 2: Headless Browser
+  suc_pos_http = sum(
+      1
+      for it in lote
+      if it.get("status_extracao") == "SUCESSO" and it.get("texto_completo")
+  )
+  if (suc_pos_http / univ_util * 100.0) < META_SUCESSO_GLOBAL:
+    pendentes_pw = [
+        (i, it)
+        for i, it in enumerate(lote)
+        if it.get("status_extracao") in ["PENDENTE", "FALHA_ACESSO"]
+        and it.get("status_resolucao")
+        not in [
+            "CONTEUDO_MIDIA",
+            "PLATAFORMA_FECHADA",
+            "REDIRECT_HOMEPAGE",
+            "LINK_MORTO",
+        ]
+    ]
+    random.shuffle(pendentes_pw)
+    for c in range(0, len(pendentes_pw), 20):
+      chunk = pendentes_pw[c : c + 20]
+      res_chunk = processar_lote_playwright(chunk)
+      for idx, item_proc, _ in res_chunk:
+        lote[idx] = item_proc
+
+      suc_atual = sum(
+          1
+          for it in lote
+          if it.get("status_extracao") == "SUCESSO" and it.get("texto_completo")
+      )
+      if (suc_atual / univ_util * 100.0) >= META_SUCESSO_GLOBAL:
+        break
+
+  # Harmonização e Expurgo Anti-Bot residual
+  for item in lote:
+    u_can = item.get("url_canonica_resolvida")
+    u_util = item.get("url_utilizada")
+    esps_disp = (
+        item.get("urls_espelho_disponiveis") or item.get("urls_espelho") or []
+    )
+
+    if not sanitizar_url_canonica(u_can) and sanitizar_url_canonica(u_util):
+      item["url_canonica_resolvida"] = u_util.strip()
+      item["status_resolucao"] = "RESOLVIDO"
+    elif not sanitizar_url_canonica(item.get("url_canonica_resolvida")):
+      for e in esps_disp:
+        if sanitizar_url_canonica(e):
+          item["url_canonica_resolvida"] = e.strip()
+          item["url_utilizada"] = e.strip()
+          item["status_resolucao"] = "RESOLVIDO"
+          break
+
+    item["urls_espelho_canonicas"] = [
+        e for e in esps_disp if sanitizar_url_canonica(e)
+    ]
+
+    txt = item.get("texto_completo")
+    if (
+        txt
+        and item.get("status_extracao") == "SUCESSO"
+        and REGEX_ANTIBOT.search(txt)
+    ):
+      item["texto_completo"] = None
+      item["status_extracao"] = "FALHA_ACESSO"
+      item["motivo_bloqueio"] = "ANTIBOT_CHALLENGE"
+      item["necessita_extracao_manual"] = True
+
+  # Gravação Atômica
+  tmp = caminho_arquivo + ".tmp"
+  with open(tmp, "w", encoding="utf-8") as f_out:
+    json.dump(lote, f_out, ensure_ascii=False, indent=2)
+  os.replace(tmp, caminho_arquivo)
+
+  expurgar_recursos_sistema()
+  logging.info(f"[CONCLUÍDO] {nome_arq} gravado.")
+
+
+if __name__ == "__main__":
+  parser = argparse.ArgumentParser()
+  parser.add_argument(
+      "--arquivos", nargs="+", required=True, help="Arquivos para processar"
+  )
+  args = parser.parse_args()
+  for arq in args.arquivos:
+    if os.path.exists(arq):
+      processar_arquivo(arq)
