@@ -36,8 +36,11 @@ jobs:
         run: |
           echo "$GDRIVE_SA_KEY" > /tmp/gdrive_sa.json
           
-          # Higienização automática: extrai estritamente o código alfanumérico do ID
-          CLEAN_ID=$(echo "$GDRIVE_FOLDER_ID" | sed -E 's/.*folders\///' | sed -E 's/\?.*//' | tr -d '[:space:]"'')
+          # Higienização segura: extrai a sequência alfanumérica de 25+ caracteres do ID
+          CLEAN_ID=$(echo "$GDRIVE_FOLDER_ID" | grep -oE '[a-zA-Z0-9_-]{25,}' | head -n 1)
+          if [ -z "$CLEAN_ID" ]; then
+            CLEAN_ID="$GDRIVE_FOLDER_ID"
+          fi
           echo "ID_HIGIENIZADO=$CLEAN_ID" >> $GITHUB_ENV
           
           mkdir -p ~/.config/rclone
@@ -47,6 +50,7 @@ jobs:
           scope = drive
           service_account_file = /tmp/gdrive_sa.json
           root_folder_id = $CLEAN_ID
+          include_shared_with_me = true
           EOF
 
       - name: Baixar Lote Específico do Runner
