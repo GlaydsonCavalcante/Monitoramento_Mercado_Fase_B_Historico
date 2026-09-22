@@ -548,11 +548,8 @@ def processar_arquivo(caminho_arquivo: str, runner_id: int = 0):
     univ_util = max(1, total_n - desist_ini)
 
     if (sucesso_ini / univ_util * 100.0) >= META_SUCESSO_GLOBAL:
-        logging.info(
-            f"[SALTADO] {nome_arq} ja alcancou a meta ({sucesso_ini}/{univ_util} ="
-            f" {sucesso_ini/univ_util*100:.1f}%)"
-        )
-        return
+    logging.info(f"[SALTADO] {nome_arq}...")
+    return {"nome": nome_arq, "status": "SALTADO", "eficacia": (sucesso_ini / univ_util * 100.0)}
 
     logging.info(
         f"[PROCESSANDO] {nome_arq} - Total: {total_n} | Validos Iniciais:"
@@ -713,17 +710,32 @@ def processar_arquivo(caminho_arquivo: str, runner_id: int = 0):
 
     expurgar_recursos_sistema()
     logging.info(f"[CONCLUÍDO] {nome_arq} processado e sincronizado no Drive.")
+    return {"nome": nome_arq, "status": "PROCESSADO", "eficacia": (suc_final / univ_util * 100.0)}
 
 
 if __name__ == "__main__":
+    from notifyer import enviar_resumo_runner_telegram
+
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--arquivos", nargs="+", required=True, help="Arquivos para processar"
-    )
-    parser.add_argument(
-        "--runner_id", type=int, default=0, help="Identificador do Runner"
-    )
+    parser.add_argument("--arquivos", nargs="+", required=True, help="Arquivos para processar")
+    parser.add_argument("--runner_id", type=int, default=0, help="Identificador do Runner")
     args = parser.parse_args()
+
+    t_inicio_bloco = time.perf_counter()
+    auditoria_bloco = []
+
     for arq in args.arquivos:
         if os.path.exists(arq):
-            processar_arquivo(arq, runner_id=args.runner_id)
+            res = processar_arquivo(arq, runner_id=args.runner_id)
+            if res:
+                auditoria_bloco.append(res)
+            else:
+                auditoria_bloco.append({"nome": os.path.basename(arq), "status": "FALHA", "eficacia": 0.0})
+
+    t_duracao_bloco = time.perf_counter() - t_inicio_bloco
+    enviar_resumo_runner_telegram(
+        runner_id=args.runner_id,
+        total_alocados=len(args.arquivos),
+        tempo_total_s=t_duracao_bloco,
+        lista_detalhada=auditoria_bloco
+    )
