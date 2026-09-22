@@ -7,7 +7,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import gc
 import json
 import logging
-import math
 import os
 import random
 import re
@@ -24,7 +23,7 @@ from requests.adapters import HTTPAdapter
 import trafilatura
 from urllib3.util import Retry
 
-from notifyer import enviar_alerta_telegram
+from notifyer import enviar_alerta_telegram, enviar_resumo_runner_telegram
 
 socket.setdefaulttimeout(3.0)
 
@@ -518,7 +517,7 @@ def expurgar_recursos_sistema():
     HTTP_SESSION = criar_sessao_http()
 
 
-def processar_arquivo(caminho_arquivo: str, runner_id: int = 0):
+def processar_arquivo(caminho_arquivo: str, runner_id: int = 0) -> dict:
     """Executa a cadeia de extração completa para um único arquivo JSON."""
     t_ini_arquivo = time.perf_counter()
     nome_arq = os.path.basename(caminho_arquivo)
@@ -527,7 +526,7 @@ def processar_arquivo(caminho_arquivo: str, runner_id: int = 0):
 
     total_n = len(lote)
     if total_n == 0:
-        return
+        return {"nome": nome_arq, "status": "VAZIO", "eficacia": 0.0}
 
     sucesso_ini = sum(
         1
@@ -546,19 +545,20 @@ def processar_arquivo(caminho_arquivo: str, runner_id: int = 0):
         ]
     )
     univ_util = max(1, total_n - desist_ini)
+    efic_ini = (sucesso_ini / univ_util * 100.0)
 
-    if (sucesso_ini / univ_util * 100.0) >= META_SUCESSO_GLOBAL:
-    logging.info(f"[SALTADO] {nome_arq}...")
-    return {"nome": nome_arq, "status": "SALTADO", "eficacia": (sucesso_ini / univ_util * 100.0)}
+    if efic_ini >= META_SUCESSO_GLOBAL:
+        logging.info(
+            f"[SALTADO] {nome_arq} já alcançou a meta ({sucesso_ini}/{univ_util} = {efic_ini:.1f}%)"
+        )
+        return {"nome": nome_arq, "status": "SALTADO", "eficacia": efic_ini}
 
     logging.info(
-        f"[PROCESSANDO] {nome_arq} - Total: {total_n} | Validos Iniciais:"
-        f" {sucesso_ini} ({sucesso_ini/univ_util*100:.1f}%)"
+        f"[PROCESSANDO] {nome_arq} - Total: {total_n} | Válidos Iniciais:"
+        f" {sucesso_ini} ({efic_ini:.1f}%)"
     )
 
-    # --------------------------------------------------------------------------
-    # ESTÁGIO 1: FAST HTTP
-    # --------------------------------------------------------------------------
+    # Estágio 1: Fast HTTP
     pendentes_http = [
         (i, it)
         for i, it in enumerate(lote)
@@ -586,9 +586,7 @@ def processar_arquivo(caminho_arquivo: str, runner_id: int = 0):
         if (suc_atual / univ_util * 100.0) >= META_SUCESSO_GLOBAL:
             break
 
-    # --------------------------------------------------------------------------
-    # ESTÁGIO 2: HEADLESS BROWSER (STEALTH)
-    # --------------------------------------------------------------------------
+    # Estágio 2: Headless Browser (Playwright Stealth)
     suc_pos_http = sum(
         1
         for it in lote
@@ -622,9 +620,7 @@ def processar_arquivo(caminho_arquivo: str, runner_id: int = 0):
             if (suc_atual / univ_util * 100.0) >= META_SUCESSO_GLOBAL:
                 break
 
-    # --------------------------------------------------------------------------
-    # HARMONIZAÇÃO CANÔNICA E EXPURGO ANTI-BOT RESIDUAL
-    # --------------------------------------------------------------------------
+    # Harmonização Canônica e Expurgo Anti-Bot Residual
     for item in lote:
         u_can = item.get("url_canonica_resolvida")
         u_util = item.get("url_utilizada")
@@ -658,17 +654,13 @@ def processar_arquivo(caminho_arquivo: str, runner_id: int = 0):
             item["motivo_bloqueio"] = "ANTIBOT_CHALLENGE"
             item["necessita_extracao_manual"] = True
 
-    # --------------------------------------------------------------------------
-    # GRAVAÇÃO ATÔMICA LOCAL
-    # --------------------------------------------------------------------------
+    # Gravação Atômica Local
     tmp = caminho_arquivo + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f_out:
         json.dump(lote, f_out, ensure_ascii=False, indent=2)
     os.replace(tmp, caminho_arquivo)
 
-    # --------------------------------------------------------------------------
-    # CONSOLIDAÇÃO DE MÉTRICAS E DESPACHO TELEGRAM
-    # --------------------------------------------------------------------------
+    # Consolidação de Métricas e Notificação Individual via Telegram
     t_duracao = time.perf_counter() - t_ini_arquivo
     suc_final = sum(
         1
@@ -702,23 +694,24 @@ def processar_arquivo(caminho_arquivo: str, runner_id: int = 0):
         tempo_execucao_s=t_duracao,
     )
 
-    # --------------------------------------------------------------------------
-    # SINCRONIZAÇÃO IMEDIATA NO GOOGLE DRIVE E HIGIENIZAÇÃO DE RECURSOS
-    # --------------------------------------------------------------------------
+    # Sincronização Imediata no Google Drive via Rclone
     remote_path = os.getenv("RCLONE_REMOTE_PATH", "gdrive:")
     os.system(f"rclone copyto '{caminho_arquivo}' '{remote_path}{nome_arq}'")
 
     expurgar_recursos_sistema()
+    efic_final = (suc_final / univ_util * 100.0)
     logging.info(f"[CONCLUÍDO] {nome_arq} processado e sincronizado no Drive.")
-    return {"nome": nome_arq, "status": "PROCESSADO", "eficacia": (suc_final / univ_util * 100.0)}
+    return {"nome": nome_arq, "status": "PROCESSADO", "eficacia": efic_final}
 
 
 if __name__ == "__main__":
-    from notifyer import enviar_resumo_runner_telegram
-
     parser = argparse.ArgumentParser()
-    parser.add_argument("--arquivos", nargs="+", required=True, help="Arquivos para processar")
-    parser.add_argument("--runner_id", type=int, default=0, help="Identificador do Runner")
+    parser.add_argument(
+        "--arquivos", nargs="+", required=True, help="Arquivos para processar"
+    )
+    parser.add_argument(
+        "--runner_id", type=int, default=0, help="Identificador do Runner"
+    )
     args = parser.parse_args()
 
     t_inicio_bloco = time.perf_counter()
@@ -726,16 +719,28 @@ if __name__ == "__main__":
 
     for arq in args.arquivos:
         if os.path.exists(arq):
-            res = processar_arquivo(arq, runner_id=args.runner_id)
-            if res:
-                auditoria_bloco.append(res)
-            else:
-                auditoria_bloco.append({"nome": os.path.basename(arq), "status": "FALHA", "eficacia": 0.0})
+            try:
+                res = processar_arquivo(arq, runner_id=args.runner_id)
+                if res:
+                    auditoria_bloco.append(res)
+                else:
+                    auditoria_bloco.append({
+                        "nome": os.path.basename(arq),
+                        "status": "SALTADO",
+                        "eficacia": 0.0,
+                    })
+            except Exception as e:
+                logging.error(f"Falha operacional em {arq}: {e}")
+                auditoria_bloco.append({
+                    "nome": os.path.basename(arq),
+                    "status": "FALHA",
+                    "eficacia": 0.0,
+                })
 
     t_duracao_bloco = time.perf_counter() - t_inicio_bloco
     enviar_resumo_runner_telegram(
         runner_id=args.runner_id,
         total_alocados=len(args.arquivos),
         tempo_total_s=t_duracao_bloco,
-        lista_detalhada=auditoria_bloco
+        lista_detalhada=auditoria_bloco,
     )
