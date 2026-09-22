@@ -1,4 +1,4 @@
-name: Extracao Paralela em Matriz (Azure Runners)
+name: Monitoramento de Mercado Fase B (Extracao Paralela em Matriz)
 
 on:
   workflow_dispatch:
