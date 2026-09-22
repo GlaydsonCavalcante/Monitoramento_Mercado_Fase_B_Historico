@@ -23,7 +23,8 @@ jobs:
 
       - name: Instalar Dependencias e Playwright
         run: |
-          pip install trafilatura beautifulsoup4 googlenewsdecoder playwright requests urllib3 lxml
+          pip install --upgrade pip
+          pip install -r requirements.txt
           playwright install chromium
           playwright install-deps chromium
           sudo apt-get update && sudo apt-get install -y rclone
@@ -49,14 +50,17 @@ jobs:
           rclone lsf gdrive: --include "noticias_raw_*.json" | sort > /tmp/todos_arquivos.txt
           split -d -n l/10 /tmp/todos_arquivos.txt /tmp/grupo_
           
-          ARQUIVOS_GRUPO=$(cat /tmp/grupo_0${{ matrix.grupo }})
-          echo "Arquivos alocados para o Runner ${{ matrix.grupo }}:"
-          echo "$ARQUIVOS_GRUPO"
-          
-          for f in $ARQUIVOS_GRUPO; do
-            rclone copy "gdrive:$f" dados_locais/
-          done
-
+          ARQ_SPLIT="/tmp/grupo_0${{ matrix.grupo }}"
+          if [ -f "$ARQ_SPLIT" ]; then
+            ARQUIVOS_GRUPO=$(cat "$ARQ_SPLIT")
+            echo "Arquivos alocados para o Runner ${{ matrix.grupo }}:"
+            echo "$ARQUIVOS_GRUPO"
+            for f in $ARQUIVOS_GRUPO; do
+              rclone copy "gdrive:$f" dados_locais/
+            done
+          else
+            echo "Nenhum arquivo atribuido a este runner."
+          fi
       - name: Executar Extracao
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
