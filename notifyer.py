@@ -51,3 +51,52 @@ def enviar_alerta_telegram(
           f"Falha ao enviar notificacao Telegram para {chat_id}: {err}",
           flush=True,
       )
+
+def enviar_resumo_runner_telegram(
+    runner_id: int,
+    total_alocados: int,
+    tempo_total_s: float,
+    lista_detalhada: list[dict]
+) -> None:
+    """Envia despacho consolidado com a lista de arquivos avaliados pelo runner."""
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID")
+    if not token or not chat_id:
+        return
+
+    minutos = int(tempo_total_s // 60)
+    segundos = int(tempo_total_s % 60)
+
+    sucessos = sum(1 for a in lista_detalhada if a["status"] == "PROCESSADO")
+    saltados = sum(1 for a in lista_detalhada if a["status"] == "SALTADO")
+    falhas = sum(1 for a in lista_detalhada if a["status"] == "FALHA")
+
+    linhas_arquivos = []
+    for a in lista_detalhada:
+        if a["status"] == "PROCESSADO":
+            linhas_arquivos.append(f"✅ <code>{a['nome']}</code> ({a['eficacia']:.1f}%)")
+        elif a["status"] == "SALTADO":
+            linhas_arquivos.append(f"⏭️ <code>{a['nome']}</code> (Saltado: {a['eficacia']:.1f}%)")
+        else:
+            linhas_arquivos.append(f"❌ <code>{a['nome']}</code> (Falha)")
+
+    bloco_itens = "\n".join(linhas_arquivos)
+    
+    texto = (
+        f"🏁 <b>[Runner {runner_id}] Conclusão do Bloco</b>\n"
+        f"Tempo Total: {minutos}m {segundos}s | Arquivos: {total_alocados}\n\n"
+        f"<b>Resumo:</b>\n"
+        f"• Processados: {sucessos}\n"
+        f"• Saltados: {saltados}\n"
+        f"• Falhas: {falhas}\n\n"
+        f"<b>Detalhamento:</b>\n"
+        f"{bloco_itens}"
+    )
+
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {"chat_id": chat_id, "text": texto, "parse_mode": "HTML"}
+    
+    try:
+        requests.post(url, json=payload, timeout=10)
+    except Exception as e:
+        logging.error(f"Erro ao enviar resumo do runner {runner_id}: {e}")
