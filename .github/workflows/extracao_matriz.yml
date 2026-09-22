@@ -46,8 +46,26 @@ jobs:
 
       - name: Baixar Lote Específico do Runner
         run: |
+          set -e
           mkdir -p dados_locais
-          rclone lsf gdrive: --include "noticias_raw_*.json" | sort > /tmp/todos_arquivos.txt
+          
+          # Testa a conexão direta com o Google Drive
+          echo ">> Listando arquivos no Google Drive via Rclone..."
+          rclone lsf gdrive: > /tmp/todos_arquivos_brutos.txt
+          
+          # Filtra apenas os arquivos JSON de notícias
+          grep -E '^noticias_raw_.*\.json$' /tmp/todos_arquivos_brutos.txt | sort > /tmp/todos_arquivos.txt || true
+          
+          TOTAL_ENCONTRADO=$(wc -l < /tmp/todos_arquivos.txt)
+          echo ">> Total de arquivos de notícias localizados no Drive: $TOTAL_ENCONTRADO"
+          
+          if [ "$TOTAL_ENCONTRADO" -eq 0 ]; then
+            echo "ERRO CRÍTICO: Rclone não localizou nenhum arquivo 'noticias_raw_*.json'."
+            echo "Verifique se o GDRIVE_FOLDER_ID é da pasta 'dados_brutos' e se a Service Account tem permissão de Editor."
+            exit 1
+          fi
+
+          # Divide os arquivos encontrados igualmente entre os 10 runners
           split -d -n l/10 /tmp/todos_arquivos.txt /tmp/grupo_
           
           ARQ_SPLIT="/tmp/grupo_0${{ matrix.grupo }}"
@@ -58,25 +76,31 @@ jobs:
             for f in $ARQUIVOS_GRUPO; do
               rclone copy "gdrive:$f" dados_locais/
             done
-          else
-            echo "Nenhum arquivo atribuido a este runner."
           fi
+
       - name: Executar Extracao
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
+          set -e
           ARQUIVOS_LOCAIS=$(find dados_locais/ -name "noticias_raw_*.json" | tr '\n' ' ')
-          if [ -n "$ARQUIVOS_LOCAIS" ]; then
-            python extrator_lote.py --arquivos $ARQUIVOS_LOCAIS --runner_id ${{ matrix.grupo }}
+          
+          if [ -z "$ARQUIVOS_LOCAIS" ]; then
+            echo "ERRO: Nenhum arquivo disponível em dados_locais/ para processamento."
+            exit 1
           fi
+          
+          python extrator_lote.py --arquivos $ARQUIVOS_LOCAIS --runner_id ${{ matrix.grupo }}
 
       - name: Sincronizar Arquivos de Volta no Google Drive
         if: always()
         run: |
-          for f in dados_locais/noticias_raw_*.json; do
-            if [ -f "$f" ]; then
-              rclone copyto "$f" "gdrive:$(basename $f)"
-            fi
-          done
+          if [ -d "dados_locais" ]; then
+            for f in dados_locais/noticias_raw_*.json; do
+              if [ -f "$f" ]; then
+                rclone copyto "$f" "gdrive:$(basename $f)"
+              fi
+            done
+          fi
           rm -f /tmp/gdrive_sa.json
