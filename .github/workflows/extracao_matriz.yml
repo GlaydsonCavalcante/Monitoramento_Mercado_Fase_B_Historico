@@ -1,0 +1,75 @@
+name: Extracao Paralela em Matriz (Azure Runners)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  executar_extracao:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        grupo: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+
+    steps:
+      - name: Checkout do Repositorio
+        uses: actions/checkout@v4
+
+      - name: Configurar Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Instalar Dependencias e Playwright
+        run: |
+          pip install trafilatura beautifulsoup4 googlenewsdecoder playwright requests urllib3 lxml
+          playwright install chromium
+          playwright install-deps chromium
+          sudo apt-get update && sudo apt-get install -y rclone
+
+      - name: Configurar Rclone para Google Drive
+        env:
+          GDRIVE_SA_KEY: ${{ secrets.GDRIVE_SA_KEY }}
+          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+        run: |
+          echo "$GDRIVE_SA_KEY" > /tmp/gdrive_sa.json
+          mkdir -p ~/.config/rclone
+          cat <<EOF > ~/.config/rclone/rclone.conf
+          [gdrive]
+          type = drive
+          scope = drive
+          service_account_file = /tmp/gdrive_sa.json
+          root_folder_id = $GDRIVE_FOLDER_ID
+          EOF
+
+      - name: Baixar Lote Específico do Runner
+        run: |
+          mkdir -p dados_locais
+          rclone lsf gdrive: --include "noticias_raw_*.json" | sort > /tmp/todos_arquivos.txt
+          split -d -n l/10 /tmp/todos_arquivos.txt /tmp/grupo_
+          
+          ARQUIVOS_GRUPO=$(cat /tmp/grupo_0${{ matrix.grupo }})
+          echo "Arquivos alocados para o Runner ${{ matrix.grupo }}:"
+          echo "$ARQUIVOS_GRUPO"
+          
+          for f in $ARQUIVOS_GRUPO; do
+            rclone copy "gdrive:$f" dados_locais/
+          done
+
+      - name: Executar Extracao
+        run: |
+          ARQUIVOS_LOCAIS=$(find dados_locais/ -name "noticias_raw_*.json" | tr '\n' ' ')
+          if [ -n "$ARQUIVOS_LOCAIS" ]; then
+            python extrator_lote.py --arquivos $ARQUIVOS_LOCAIS
+          fi
+
+      - name: Sincronizar Arquivos de Volta no Google Drive
+        if: always()
+        run: |
+          for f in dados_locais/noticias_raw_*.json; do
+            if [ -f "$f" ]; then
+              rclone copyto "$f" "gdrive:$(basename $f)"
+            fi
+          done
+          rm -f /tmp/gdrive_sa.json
