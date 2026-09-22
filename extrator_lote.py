@@ -1,5 +1,8 @@
+"""Módulo de extração massiva de notícias em lote com resolução canônica e bypass stealth."""
+
 import argparse
 import asyncio
+import base64
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import gc
 import json
@@ -12,6 +15,7 @@ import socket
 import time
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse
+
 from bs4 import BeautifulSoup
 import googlenewsdecoder as gnd
 from playwright.async_api import async_playwright
@@ -89,6 +93,7 @@ REGEX_ANTIBOT = re.compile("|".join(PADROES_ANTIBOT), re.IGNORECASE)
 
 
 def criar_sessao_http() -> requests.Session:
+    """Configura pool persistente de conexões HTTP com retentativas limitadas."""
     s = requests.Session()
     retry = Retry(
         total=1,
@@ -108,6 +113,7 @@ HTTP_SESSION = criar_sessao_http()
 
 
 def classificar_url_terminal(url: str) -> Optional[str]:
+    """Identifica URLs que pertencem a redes fechadas, plataformas de mídia ou homepages."""
     if not url or not isinstance(url, str):
         return None
     try:
@@ -134,6 +140,7 @@ def classificar_url_terminal(url: str) -> Optional[str]:
 
 
 def sanitizar_url_canonica(url: Optional[str]) -> Optional[str]:
+    """Valida se a URL é externa ao Google News e possui protocolo HTTP/HTTPS."""
     if not url or not isinstance(url, str):
         return None
     u = url.strip()
@@ -153,10 +160,12 @@ def sanitizar_url_canonica(url: Optional[str]) -> Optional[str]:
 
 
 def eh_canonica(url: str) -> bool:
+    """Verifica se a URL já é canônica externa."""
     return sanitizar_url_canonica(url) is not None
 
 
 def decodificar_offline(url_google: str) -> Optional[str]:
+    """Decodifica URLs do Google News via Base64 offline quando estruturadas localmente."""
     if not url_google or "articles/" not in url_google:
         return None
     try:
@@ -173,6 +182,7 @@ def decodificar_offline(url_google: str) -> Optional[str]:
 
 
 def extrair_canonica_html(html: str) -> Optional[str]:
+    """Varre o início do HTML buscando tags canônicas ou tags de OpenGraph."""
     if not html:
         return None
     try:
@@ -195,6 +205,7 @@ def extrair_canonica_html(html: str) -> Optional[str]:
 
 
 def decodificar_google_rpc(url: str) -> Optional[str]:
+    """Resolve tokens criptografados do Google News diretamente via RPC da biblioteca interna."""
     if "news.google.com" not in url:
         return sanitizar_url_canonica(url)
     try:
@@ -207,6 +218,7 @@ def decodificar_google_rpc(url: str) -> Optional[str]:
 
 
 def extrair_texto_hibrido(html_ou_texto: str) -> Optional[str]:
+    """Extração de conteúdo textual jornalístico via Trafilatura com fallback estrutural."""
     if not html_ou_texto:
         return None
 
@@ -246,6 +258,7 @@ def extrair_texto_hibrido(html_ou_texto: str) -> Optional[str]:
 def extrair_texto_e_canonica_http(
     url: str,
 ) -> Tuple[Optional[str], Optional[str]]:
+    """Executa requisição HTTP rápida retornando texto e metatag canônica se presentes."""
     try:
         headers = {"User-Agent": random.choice(USER_AGENTS)}
         resp = HTTP_SESSION.get(
@@ -262,6 +275,7 @@ def extrair_texto_e_canonica_http(
 
 
 def processar_item_estagio_http(item_tuple: Tuple[int, dict]) -> Tuple[int, dict, bool]:
+    """Processamento rápido do Estágio 1: decodificação RPC e conexões HTTP diretas."""
     idx, item = item_tuple
     ja_tinha_txt = bool(
         item.get("status_extracao") == "SUCESSO" and item.get("texto_completo")
@@ -365,6 +379,7 @@ def processar_item_estagio_http(item_tuple: Tuple[int, dict]) -> Tuple[int, dict
 
 
 async def _navegar_com_timeout_estrito(context, item_tuple: Tuple[int, dict]) -> Tuple[int, dict, bool]:
+    """Execução controlada no navegador headless para contornar consent walls e renderizações dinâmicas."""
     idx, item = item_tuple
     url_alvo = item.get("url_utilizada") or item.get("url_original_rss") or ""
     page = None
@@ -446,6 +461,7 @@ async def _navegar_com_timeout_estrito(context, item_tuple: Tuple[int, dict]) ->
 async def processar_lote_playwright_async(
     itens: List[Tuple[int, dict]],
 ) -> List[Tuple[int, dict, bool]]:
+    """Gerencia instâncias assíncronas do Chromium sob semáforo restrito de 4 tarefas concorrentes."""
     if not itens:
         return []
     async with async_playwright() as p:
@@ -484,11 +500,13 @@ async def processar_lote_playwright_async(
 def processar_lote_playwright(
     itens: List[Tuple[int, dict]],
 ) -> List[Tuple[int, dict, bool]]:
+    """Interface síncrona para execução do pool assíncrono do Playwright."""
     loop = asyncio.get_event_loop()
     return loop.run_until_complete(processar_lote_playwright_async(itens))
 
 
 def expurgar_recursos_sistema():
+    """Finaliza processos residuais de renderização do Chromium e recicla a sessão HTTP."""
     global HTTP_SESSION
     os.system("pkill -9 -f chrome || true")
     os.system("pkill -9 -f playwright || true")
@@ -501,6 +519,7 @@ def expurgar_recursos_sistema():
 
 
 def processar_arquivo(caminho_arquivo: str, runner_id: int = 0):
+    """Executa a cadeia de extração completa para um único arquivo JSON."""
     t_ini_arquivo = time.perf_counter()
     nome_arq = os.path.basename(caminho_arquivo)
     with open(caminho_arquivo, "r", encoding="utf-8") as f:
@@ -530,17 +549,19 @@ def processar_arquivo(caminho_arquivo: str, runner_id: int = 0):
 
     if (sucesso_ini / univ_util * 100.0) >= META_SUCESSO_GLOBAL:
         logging.info(
-            f"[SALTADO] {nome_arq} já alcançou a meta ({sucesso_ini}/{univ_util} ="
+            f"[SALTADO] {nome_arq} ja alcancou a meta ({sucesso_ini}/{univ_util} ="
             f" {sucesso_ini/univ_util*100:.1f}%)"
         )
         return
 
     logging.info(
-        f"[PROCESSANDO] {nome_arq} - Total: {total_n} | Válidos Iniciais:"
+        f"[PROCESSANDO] {nome_arq} - Total: {total_n} | Validos Iniciais:"
         f" {sucesso_ini} ({sucesso_ini/univ_util*100:.1f}%)"
     )
 
-    # Estágio 1: Fast HTTP
+    # --------------------------------------------------------------------------
+    # ESTÁGIO 1: FAST HTTP
+    # --------------------------------------------------------------------------
     pendentes_http = [
         (i, it)
         for i, it in enumerate(lote)
@@ -568,7 +589,9 @@ def processar_arquivo(caminho_arquivo: str, runner_id: int = 0):
         if (suc_atual / univ_util * 100.0) >= META_SUCESSO_GLOBAL:
             break
 
-    # Estágio 2: Headless Browser
+    # --------------------------------------------------------------------------
+    # ESTÁGIO 2: HEADLESS BROWSER (STEALTH)
+    # --------------------------------------------------------------------------
     suc_pos_http = sum(
         1
         for it in lote
@@ -578,7 +601,7 @@ def processar_arquivo(caminho_arquivo: str, runner_id: int = 0):
         pendentes_pw = [
             (i, it)
             for i, it in enumerate(lote)
-            if item_proc_status in ["PENDENTE", "FALHA_ACESSO"]
+            if it.get("status_extracao") in ["PENDENTE", "FALHA_ACESSO"]
             and it.get("status_resolucao")
             not in [
                 "CONTEUDO_MIDIA",
@@ -602,7 +625,9 @@ def processar_arquivo(caminho_arquivo: str, runner_id: int = 0):
             if (suc_atual / univ_util * 100.0) >= META_SUCESSO_GLOBAL:
                 break
 
-    # Harmonização e Expurgo Anti-Bot
+    # --------------------------------------------------------------------------
+    # HARMONIZAÇÃO CANÔNICA E EXPURGO ANTI-BOT RESIDUAL
+    # --------------------------------------------------------------------------
     for item in lote:
         u_can = item.get("url_canonica_resolvida")
         u_util = item.get("url_utilizada")
@@ -636,13 +661,17 @@ def processar_arquivo(caminho_arquivo: str, runner_id: int = 0):
             item["motivo_bloqueio"] = "ANTIBOT_CHALLENGE"
             item["necessita_extracao_manual"] = True
 
-    # Gravação Atômica
+    # --------------------------------------------------------------------------
+    # GRAVAÇÃO ATÔMICA LOCAL
+    # --------------------------------------------------------------------------
     tmp = caminho_arquivo + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f_out:
         json.dump(lote, f_out, ensure_ascii=False, indent=2)
     os.replace(tmp, caminho_arquivo)
 
-    # Notificação via Telegram
+    # --------------------------------------------------------------------------
+    # CONSOLIDAÇÃO DE MÉTRICAS E DESPACHO TELEGRAM
+    # --------------------------------------------------------------------------
     t_duracao = time.perf_counter() - t_ini_arquivo
     suc_final = sum(
         1
@@ -676,8 +705,14 @@ def processar_arquivo(caminho_arquivo: str, runner_id: int = 0):
         tempo_execucao_s=t_duracao,
     )
 
+    # --------------------------------------------------------------------------
+    # SINCRONIZAÇÃO IMEDIATA NO GOOGLE DRIVE E HIGIENIZAÇÃO DE RECURSOS
+    # --------------------------------------------------------------------------
+    remote_path = os.getenv("RCLONE_REMOTE_PATH", "gdrive:")
+    os.system(f"rclone copyto '{caminho_arquivo}' '{remote_path}{nome_arq}'")
+
     expurgar_recursos_sistema()
-    logging.info(f"[CONCLUÍDO] {nome_arq} gravado.")
+    logging.info(f"[CONCLUÍDO] {nome_arq} processado e sincronizado no Drive.")
 
 
 if __name__ == "__main__":
