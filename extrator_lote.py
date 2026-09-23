@@ -32,7 +32,7 @@ logging.basicConfig(
 )
 
 # Constantes e Metas Metodológicas
-META_SUCESSO_GLOBAL = 60.0
+META_SUCESSO_GLOBAL = 70.0
 TAMANHO_MINIMO_TEXTO = 200
 MAX_WORKERS_HTTP = 8
 
